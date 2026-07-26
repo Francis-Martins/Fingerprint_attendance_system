@@ -160,7 +160,7 @@ void setup() {
 
   tft.init();
   tft.invertDisplay(true);
-  tft.setRotation(1);
+  tft.setRotation(3);
   tft.fillScreen(TFT_BLACK);
 
   drawBanner("Connecting WiFi...", TFT_YELLOW);
@@ -234,8 +234,8 @@ void handleTouch() {
   if (millis() - lastTouchMs < TOUCH_DEBOUNCE_MS) return;
 
   TS_Point p = touchscreen.getPoint();
-  int screenX = map(p.x, RAW_X_MIN, RAW_X_MAX, 0, 320);
-  int screenY = map(p.y, RAW_Y_MIN, RAW_Y_MAX, 0, 240);
+  int screenX = map(p.x, RAW_X_MAX, RAW_X_MIN, 0, 320);
+  int screenY = map(p.y, RAW_Y_MAX, RAW_Y_MIN, 0, 240);
   screenX = constrain(screenX, 0, 320);
   screenY = constrain(screenY, 0, 240);
 
