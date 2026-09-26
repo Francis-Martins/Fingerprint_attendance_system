@@ -30,10 +30,10 @@ TFT_eSPI tft = TFT_eSPI();
 SPIClass touchscreenSPI = SPIClass(VSPI);
 XPT2046_Touchscreen touchscreen(XPT2046_CS, XPT2046_IRQ);
 
-#define RAW_X_MIN 330
-#define RAW_X_MAX 3720
-#define RAW_Y_MIN 440
-#define RAW_Y_MAX 3750
+#define RAW_X_MIN 482
+#define RAW_X_MAX 3513
+#define RAW_Y_MIN 232
+#define RAW_Y_MAX 1241
 
 unsigned long lastTouchMs = 0;
 const unsigned long TOUCH_DEBOUNCE_MS = 250;
@@ -49,8 +49,6 @@ Btn homeButtons[2] = {
 };
 
 Btn menuButton = {260, 5, 55, 25, "MENU"};
-
-// Toggle button shown only in MATCH_MODE idle screen
 Btn toggleButton = {195, 5, 60, 25, "MODE"};
 
 // ==================================================================
@@ -63,12 +61,9 @@ Adafruit_Fingerprint finger(&fpSerial);
 
 // ==================================================================
 //  RFID (PN532, I2C)
-//  NOTE: test wiring below. Final wiring will move to GPIO1/GPIO3 (UART0),
-//  which requires Serial debugging disabled (already the plan since
-//  device will run off external power, not USB).
 // ==================================================================
-#define RFID_SDA_PIN 4   
-#define RFID_SCL_PIN 17  
+#define RFID_SDA_PIN 4
+#define RFID_SCL_PIN 17
 Adafruit_PN532 nfc(-1, -1);
 bool rfidReady = false;
 
@@ -80,6 +75,21 @@ FirebaseData fbdoCmd;
 FirebaseAuth auth;
 FirebaseConfig config;
 bool firebaseReady = false;
+
+// ==================================================================
+//  Local user cache — populated once at boot only
+// ==================================================================
+struct UserRecord {
+  bool hasFingerprint;
+  int fingerprintID;
+  bool hasRFID;
+  String rfidUID;
+  String name;
+};
+
+#define MAX_CACHED_USERS 100
+UserRecord userCache[MAX_CACHED_USERS];
+int userCacheCount = 0;
 
 // ==================================================================
 //  NTP
@@ -109,10 +119,35 @@ const unsigned long COOLDOWN_MS = 3000;
 
 unsigned long lastCommandCheck = 0;
 const unsigned long COMMAND_POLL_MS = 2500;
+unsigned long lastRFIDPoll = 0;
+const unsigned long RFID_POLL_INTERVAL_MS = 150;
+const unsigned long RFID_READ_TIMEOUT_MS = 50;
 
 bool commandActive = false;
 unsigned long commandDoneAt = 0;
 const unsigned long COMMAND_RESULT_HOLD_MS = 3000;
+
+// ==================================================================
+//  STATE TRACE (debug instrumentation)
+// ==================================================================
+const char* currentState = "Booting";
+unsigned long lastStateChangeMs = 0;
+
+void setState(const char* newState) {
+  unsigned long now = millis();
+  // strcmp so we only print on genuine change, not every loop tick
+  if (strcmp(currentState, newState) != 0) {
+    unsigned long duration = now - lastStateChangeMs;
+    Serial.print("[STATE] ");
+    Serial.print(currentState);
+    Serial.print("  (held for ");
+    Serial.print(duration);
+    Serial.print(" ms)  ->  ");
+    Serial.println(newState);
+    currentState = newState;
+    lastStateChangeMs = now;
+  }
+}
 
 // ---------- Forward decls ----------
 void connectWiFi();
@@ -120,14 +155,17 @@ void setupFirebase();
 void setupTime();
 String getDateString();
 String getTimeString();
+void refreshUserCache();
 String getUserNameByFingerprintID(int fingerID);
 String getUserNameByRFID(String uid, String &matchedKey);
+
 void logAttendance(String name, String mode, String idField, String idValue);
 
 void pollFingerprint();
 void pollRFID();
 void pollCommands();
 void finishCommand(bool ok, const char* message, int assignedID = -1, String assignedUID = "");
+
 void runEnroll();
 void runEnrollRFID();
 void runDelete(int targetID);
@@ -147,6 +185,7 @@ void drawCommandScreen(String msg, uint16_t color);
 void drawMenuButton();
 void drawToggleButton();
 void drawButton(Btn b);
+void drawTouchMarker(int x, int y);
 
 // ==================================================================
 //  Setup
@@ -160,18 +199,28 @@ void setup() {
 
   tft.init();
   tft.invertDisplay(true);
-  tft.setRotation(3);
+  tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
 
+  setState("WiFi: connecting");
   drawBanner("Connecting WiFi...", TFT_YELLOW);
   connectWiFi();
 
+  setState("NTP: syncing time");
   drawBanner("Syncing time...", TFT_YELLOW);
   setupTime();
 
+  setState("Firebase: connecting/auth");
   drawBanner("Connecting Firebase...", TFT_YELLOW);
   setupFirebase();
 
+  if (firebaseReady) {
+    setState("Firebase: loading user cache");
+    drawBanner("Loading users...", TFT_YELLOW);
+    refreshUserCache();
+  }
+
+  setState("FP: init serial");
   fpSerial.begin(57600, SERIAL_8N1, FP_RX, FP_TX);
   delay(100);
 
@@ -179,9 +228,11 @@ void setup() {
     drawBanner("FP Sensor OK", TFT_GREEN);
   } else {
     drawBanner("FP Sensor NOT found!", TFT_RED);
+    setState("HALTED: FP sensor not found");
     while (1) delay(1000);
   }
 
+  setState("RFID: init");
   Wire.begin(RFID_SDA_PIN, RFID_SCL_PIN);
   nfc.begin();
   uint32_t versiondata = nfc.getFirmwareVersion();
@@ -195,6 +246,7 @@ void setup() {
   }
   delay(600);
 
+  setState("Touch: init");
   touchscreenSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
   touchscreen.begin(touchscreenSPI);
 
@@ -206,6 +258,7 @@ void setup() {
 //  Loop
 // ==================================================================
 void loop() {
+  setState("Listening for touch");
   handleTouch();
 
   switch (appMode) {
@@ -231,52 +284,91 @@ void loop() {
 // ==================================================================
 void handleTouch() {
   if (!touchscreen.touched()) return;
-  if (millis() - lastTouchMs < TOUCH_DEBOUNCE_MS) return;
 
   TS_Point p = touchscreen.getPoint();
-  int screenX = map(p.x, RAW_X_MAX, RAW_X_MIN, 0, 320);
-  int screenY = map(p.y, RAW_Y_MAX, RAW_Y_MIN, 0, 240);
+
+  // Print raw coordinates immediately, before any debounce logic,
+  // so we always see exactly what the touch controller reported.
+  Serial.print("[RAW] x=");
+  Serial.print(p.x);
+  Serial.print(" y=");
+  Serial.println(p.y);
+
+  unsigned long nowMs = millis();
+  if (nowMs - lastTouchMs < TOUCH_DEBOUNCE_MS) {
+    return;  // still print raw above, just skip further action
+  }
+
+  int screenX = map(p.x, RAW_X_MIN, RAW_X_MAX, 0, 320);
+  int screenY = map(p.y, RAW_Y_MIN, RAW_Y_MAX, 0, 240);
   screenX = constrain(screenX, 0, 320);
   screenY = constrain(screenY, 0, 240);
-
+  drawTouchMarker(screenX, screenY);
   lastTouchMs = millis();
 
+  Serial.print("[TOUCH] Raw x=");
+  Serial.print(p.x);
+  Serial.print(" y=");
+  Serial.print(p.y);
+  Serial.print("  ->  Screen x=");
+  Serial.print(screenX);
+  Serial.print(" y=");
+  Serial.print(screenY);
+  Serial.print("  at millis=");
+  Serial.print(nowMs);
+  Serial.print("  [STATE at tap time: ");
+  Serial.print(currentState);
+  Serial.println("]");
+
   if (appMode == HOME) {
+    Serial.println("[TOUCH] appMode = HOME");
     for (int i = 0; i < 2; i++) {
       Btn b = homeButtons[i];
       if (screenX >= b.x && screenX <= (b.x + b.w) &&
           screenY >= b.y && screenY <= (b.y + b.h)) {
+        Serial.print("[TOUCH] Hit button: ");
+        Serial.println(b.label);
         if (String(b.label) == "MATCH") {
+          Serial.println("[TOUCH] -> goMatchMode()");
           goMatchMode();
         } else if (String(b.label) == "ADMIN") {
+          Serial.println("[TOUCH] -> goAdminMode()");
           goAdminMode();
         }
         return;
       }
     }
+    Serial.println("[TOUCH] No button hit on HOME screen");
     return;
   }
 
-  if (appMode == ADMIN_MODE && commandActive) return;
+  if (appMode == ADMIN_MODE && commandActive) {
+    Serial.println("[TOUCH] Ignored - ADMIN_MODE command active");
+    return;
+  }
 
-  // MENU button (both MATCH_MODE and ADMIN_MODE)
+  // MENU button
   Btn b = menuButton;
   if (screenX >= b.x && screenX <= (b.x + b.w) &&
       screenY >= b.y && screenY <= (b.y + b.h)) {
+    Serial.println("[TOUCH] Hit MENU button -> goHome()");
     goHome();
     return;
   }
 
-  // TOGGLE button — only live in MATCH_MODE, and only when idle
-  // (don't let a toggle interrupt an active capture)
+  // TOGGLE button
   if (appMode == MATCH_MODE && state == IDLE) {
     Btn t = toggleButton;
     if (screenX >= t.x && screenX <= (t.x + t.w) &&
         screenY >= t.y && screenY <= (t.y + t.h)) {
+      Serial.println("[TOUCH] Hit TOGGLE button");
       matchSubMode = (matchSubMode == FP_MODE) ? RFID_MODE : FP_MODE;
       drawIdleScreen();
+      return;
     }
   }
+
+  Serial.println("[TOUCH] Touch registered but no button matched");
 }
 
 // ==================================================================
@@ -319,6 +411,7 @@ void pollCommands() {
 
   if (!firebaseReady || !Firebase.ready()) return;
 
+  setState("Firebase: getString(commands/action)");
   if (!Firebase.RTDB.getString(&fbdoCmd, "/commands/action")) {
     return;
   }
@@ -326,22 +419,29 @@ void pollCommands() {
   String action = fbdoCmd.stringData();
 
   if (action == "enroll") {
+    setState("Firebase: setString(status=in_progress)");
     Firebase.RTDB.setString(&fbdoCmd, "/commands/status", "in_progress");
     commandActive = true;
+    setState("Command: runEnroll()");
     runEnroll();
     commandDoneAt = millis();
 
   } else if (action == "enroll_rfid") {
+    setState("Firebase: setString(status=in_progress)");
     Firebase.RTDB.setString(&fbdoCmd, "/commands/status", "in_progress");
     commandActive = true;
+    setState("Command: runEnrollRFID()");
     runEnrollRFID();
     commandDoneAt = millis();
 
   } else if (action == "delete") {
     commandActive = true;
+    setState("Firebase: getInt(commands/targetID)");
     if (Firebase.RTDB.getInt(&fbdoCmd, "/commands/targetID")) {
       int targetID = fbdoCmd.intData();
+      setState("Firebase: setString(status=in_progress)");
       Firebase.RTDB.setString(&fbdoCmd, "/commands/status", "in_progress");
+      setState("Command: runDelete()");
       runDelete(targetID);
     } else {
       finishCommand(false, "No targetID provided");
@@ -351,6 +451,7 @@ void pollCommands() {
 }
 
 void finishCommand(bool ok, const char* message, int assignedID, String assignedUID) {
+  setState("Firebase: finishCommand() writes");
   if (assignedID >= 0) {
     Firebase.RTDB.setInt(&fbdoCmd, "/commands/assignedID", assignedID);
   }
@@ -363,9 +464,10 @@ void finishCommand(bool ok, const char* message, int assignedID, String assigned
 }
 
 // ==================================================================
-//  Enroll (fingerprint) — unchanged logic
+//  Enroll (fingerprint) — unchanged logic, instrumented
 // ==================================================================
 int getFreeID() {
+  setState("FP: getFreeID() scanning slots");
   for (int id = 1; id < 127; id++) {
     if (finger.loadModel(id) != FINGERPRINT_OK) return id;
   }
@@ -381,6 +483,7 @@ void runEnroll() {
   }
 
   int p = -1;
+  setState("FP Enroll: waiting for finger (1st)");
   drawCommandScreen("Place finger...", TFT_CYAN);
   unsigned long stepStart = millis();
   while (p != FINGERPRINT_OK) {
@@ -397,6 +500,7 @@ void runEnroll() {
     }
   }
 
+  setState("FP Enroll: image2Tz (1st)");
   p = finger.image2Tz(1);
   if (p != FINGERPRINT_OK) {
     drawCommandScreen("Convert failed.", TFT_RED);
@@ -404,11 +508,13 @@ void runEnroll() {
     return;
   }
 
+  setState("FP Enroll: remove finger delay");
   drawCommandScreen("Remove finger.", TFT_YELLOW);
   delay(1500);
   p = 0;
   while (p != FINGERPRINT_NOFINGER) p = finger.getImage();
 
+  setState("FP Enroll: waiting for finger (2nd)");
   drawCommandScreen("Place same\nfinger again...", TFT_CYAN);
   p = -1;
   stepStart = millis();
@@ -426,6 +532,7 @@ void runEnroll() {
     }
   }
 
+  setState("FP Enroll: image2Tz (2nd)");
   p = finger.image2Tz(2);
   if (p != FINGERPRINT_OK) {
     drawCommandScreen("Convert failed.", TFT_RED);
@@ -433,6 +540,7 @@ void runEnroll() {
     return;
   }
 
+  setState("FP Enroll: createModel");
   p = finger.createModel();
   if (p != FINGERPRINT_OK) {
     drawCommandScreen("Prints didn't\nmatch. Retry.", TFT_RED);
@@ -440,6 +548,7 @@ void runEnroll() {
     return;
   }
 
+  setState("FP Enroll: storeModel");
   p = finger.storeModel(id);
   if (p == FINGERPRINT_OK) {
     drawCommandScreen("Enrolled! ID #" + String(id), TFT_GREEN);
@@ -460,6 +569,7 @@ void runEnrollRFID() {
     return;
   }
 
+  setState("RFID Enroll: waiting for tag");
   drawCommandScreen("Tap card/tag...", TFT_CYAN);
 
   uint8_t uidBytes[7];
@@ -490,6 +600,7 @@ void runEnrollRFID() {
 }
 
 void runDelete(int targetID) {
+  setState("FP: deleteModel");
   drawCommandScreen("Deleting ID #" + String(targetID) + "...", TFT_YELLOW);
 
   int p = finger.deleteModel(targetID);
@@ -509,6 +620,7 @@ void pollFingerprint() {
   switch (state) {
 
     case IDLE: {
+      setState("FP: getImage (idle scan)");
       int p = finger.getImage();
       if (p == FINGERPRINT_OK) {
         state = CAPTURING;
@@ -518,6 +630,7 @@ void pollFingerprint() {
     }
 
     case CAPTURING: {
+      setState("FP: image2Tz (match)");
       int p = finger.image2Tz();
       if (p != FINGERPRINT_OK) {
         drawResultScreen(false, "", 0, "Scan error, try again");
@@ -526,6 +639,7 @@ void pollFingerprint() {
         break;
       }
 
+      setState("FP: fingerFastSearch");
       p = finger.fingerFastSearch();
       if (p == FINGERPRINT_OK) {
         if (finger.confidence >= 50) {
@@ -572,9 +686,16 @@ void pollRFID() {
 
     case IDLE: {
       if (!rfidReady) return;
+
+      if (millis() - lastRFIDPoll < RFID_POLL_INTERVAL_MS) return;
+      lastRFIDPoll = millis();
+
+      setState("RFID: readPassiveTargetID");
       uint8_t uidBytes[7];
       uint8_t uidLength;
-      bool found = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uidBytes, &uidLength, 300);
+
+      bool found = nfc.readPassiveTargetID(PN532_MIFARE_ISO14443A, uidBytes, &uidLength, RFID_READ_TIMEOUT_MS);
+
       if (found) {
         String uidStr = "";
         for (int i = 0; i < uidLength; i++) {
@@ -596,6 +717,7 @@ void pollRFID() {
         resultStart = millis();
         state = RESULT;
       }
+
       break;
     }
 
@@ -624,6 +746,9 @@ void pollRFID() {
 // ==================================================================
 //  Screens
 // ==================================================================
+void drawTouchMarker(int x, int y) {
+  tft.fillCircle(x, y, 4, TFT_RED);
+}
 void drawButton(Btn b) {
   tft.fillRoundRect(b.x, b.y, b.w, b.h, 8, TFT_DARKGREY);
   tft.drawRoundRect(b.x, b.y, b.w, b.h, 8, TFT_WHITE);
@@ -818,69 +943,23 @@ void setupFirebase() {
 
 // ==================================================================
 //  User lookups
-//  NOTE: /users is now keyed by push ID, not fingerprint ID.
-//  Each user node may have fingerprintID and/or rfidUID fields.
 // ==================================================================
 String getUserNameByFingerprintID(int fingerID) {
-  if (!firebaseReady || !Firebase.ready()) {
-    return "Unknown (ID #" + String(fingerID) + ")";
-  }
-
-  if (Firebase.RTDB.getJSON(&fbdo, "/users")) {
-    FirebaseJson *json = fbdo.jsonObjectPtr();
-    FirebaseJsonData result;
-    size_t count = json->iteratorBegin();
-    String key, value;
-    int type;
-    for (size_t i = 0; i < count; i++) {
-      json->iteratorGet(i, type, key, value);
-      // top-level keys only
-      if (type == FirebaseJson::JSON_OBJECT && key.indexOf('/') == -1) {
-        FirebaseJson userObj;
-        userObj.setJsonData(value);
-        FirebaseJsonData fpData, nameData;
-        if (userObj.get(fpData, "fingerprintID") && fpData.intValue == fingerID) {
-          if (userObj.get(nameData, "name")) {
-            json->iteratorEnd();
-            return nameData.stringValue;
-          }
-        }
-      }
+  for (int i = 0; i < userCacheCount; i++) {
+    if (userCache[i].hasFingerprint && userCache[i].fingerprintID == fingerID) {
+      return userCache[i].name;
     }
-    json->iteratorEnd();
   }
-
   return "Unknown (ID #" + String(fingerID) + ")";
 }
 
 String getUserNameByRFID(String uid, String &matchedKey) {
-  if (!firebaseReady || !Firebase.ready()) {
-    return "Unknown (UID " + uid + ")";
-  }
-
-  if (Firebase.RTDB.getJSON(&fbdo, "/users")) {
-    FirebaseJson *json = fbdo.jsonObjectPtr();
-    size_t count = json->iteratorBegin();
-    String key, value;
-    int type;
-    for (size_t i = 0; i < count; i++) {
-      json->iteratorGet(i, type, key, value);
-      if (type == FirebaseJson::JSON_OBJECT && key.indexOf('/') == -1) {
-        FirebaseJson userObj;
-        userObj.setJsonData(value);
-        FirebaseJsonData uidData, nameData;
-        if (userObj.get(uidData, "rfidUID") && uidData.stringValue == uid) {
-          matchedKey = key;
-          if (userObj.get(nameData, "name")) {
-            json->iteratorEnd();
-            return nameData.stringValue;
-          }
-        }
-      }
+  for (int i = 0; i < userCacheCount; i++) {
+    if (userCache[i].hasRFID && userCache[i].rfidUID == uid) {
+      matchedKey = uid;
+      return userCache[i].name;
     }
-    json->iteratorEnd();
   }
-
   matchedKey = "";
   return "Unknown (UID " + uid + ")";
 }
@@ -891,6 +970,7 @@ void logAttendance(String name, String mode, String idField, String idValue) {
     return;
   }
 
+  setState("Firebase: pushJSON (logAttendance)");
   FirebaseJson json;
   json.set("mode", mode);
   json.set(idField, idValue);
@@ -908,4 +988,50 @@ void logAttendance(String name, String mode, String idField, String idValue) {
     Serial.print("Firebase push failed: ");
     Serial.println(fbdo.errorReason());
   }
+}
+
+void refreshUserCache() {
+  if (!firebaseReady || !Firebase.ready()) {
+    Serial.println("Firebase not ready, skipping user cache load.");
+    return;
+  }
+
+  setState("Firebase: getJSON (/users)");
+  if (!Firebase.RTDB.getJSON(&fbdo, "/users")) {
+    Serial.print("User cache load failed: ");
+    Serial.println(fbdo.errorReason());
+    return;
+  }
+
+  FirebaseJson *json = fbdo.jsonObjectPtr();
+  size_t count = json->iteratorBegin();
+  String key, value;
+  int type;
+
+  int idx = 0;
+  for (size_t i = 0; i < count && idx < MAX_CACHED_USERS; i++) {
+    json->iteratorGet(i, type, key, value);
+    if (type != FirebaseJson::JSON_OBJECT || key.indexOf('/') != -1) continue;
+
+    FirebaseJson userObj;
+    userObj.setJsonData(value);
+    FirebaseJsonData fpData, uidData, nameData;
+
+    UserRecord rec;
+    rec.hasFingerprint = userObj.get(fpData, "fingerprintID");
+    rec.fingerprintID = rec.hasFingerprint ? fpData.intValue : -1;
+
+    rec.hasRFID = userObj.get(uidData, "rfidUID");
+    rec.rfidUID = rec.hasRFID ? uidData.stringValue : "";
+
+    rec.name = userObj.get(nameData, "name") ? nameData.stringValue : "Unknown";
+
+    userCache[idx++] = rec;
+  }
+  json->iteratorEnd();
+
+  userCacheCount = idx;
+  Serial.print("User cache loaded: ");
+  Serial.print(userCacheCount);
+  Serial.println(" users.");
 }
