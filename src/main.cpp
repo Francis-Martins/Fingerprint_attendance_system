@@ -85,6 +85,7 @@ struct UserRecord {
   bool hasRFID;
   String rfidUID;
   String name;
+  String regNo;
 };
 
 #define MAX_CACHED_USERS 100
@@ -156,10 +157,10 @@ void setupTime();
 String getDateString();
 String getTimeString();
 void refreshUserCache();
-String getUserNameByFingerprintID(int fingerID);
-String getUserNameByRFID(String uid, String &matchedKey);
+String getUserNameByFingerprintID(int fingerID, String &regNo);
+String getUserNameByRFID(String uid, String &matchedKey, String &regNo);
 
-void logAttendance(String name, String mode, String idField, String idValue);
+void logAttendance(String name, String regNo, String mode, String idField, String idValue);
 
 void pollFingerprint();
 void pollRFID();
@@ -642,11 +643,12 @@ void pollFingerprint() {
       setState("FP: fingerFastSearch");
       p = finger.fingerFastSearch();
       if (p == FINGERPRINT_OK) {
-        if (finger.confidence >= 50) {
-          String name = getUserNameByFingerprintID(finger.fingerID);
-          logAttendance(name, "fingerprint", "Fingerprint ID", String(finger.fingerID));
-          drawResultScreen(true, "ID #" + String(finger.fingerID), finger.confidence, name.c_str());
-        } else {
+       if (finger.confidence >= 50) {
+  String regNo;
+  String name = getUserNameByFingerprintID(finger.fingerID, regNo);
+  logAttendance(name, regNo, "fingerprint", "Fingerprint ID", String(finger.fingerID));
+  drawResultScreen(true, "ID #" + String(finger.fingerID), finger.confidence, name.c_str());
+} else {
           drawResultScreen(false, "ID #" + String(finger.fingerID), finger.confidence, "Confidence too low");
         }
       } else if (p == FINGERPRINT_NOTFOUND) {
@@ -704,15 +706,16 @@ void pollRFID() {
         }
         uidStr.toUpperCase();
 
-        String matchedKey = "";
-        String name = getUserNameByRFID(uidStr, matchedKey);
+       String matchedKey = "";
+String regNo;
+String name = getUserNameByRFID(uidStr, matchedKey, regNo);
 
-        if (matchedKey.length() > 0) {
-          logAttendance(name, "rfid", "RFID UID", uidStr);
-          drawResultScreen(true, uidStr, 0, name.c_str());
-        } else {
-          drawResultScreen(false, uidStr, 0, "Not Recognized");
-        }
+if (matchedKey.length() > 0) {
+  logAttendance(name, regNo, "rfid", "RFID UID", uidStr);
+  drawResultScreen(true, uidStr, 0, name.c_str());
+} else {
+  drawResultScreen(false, uidStr, 0, "Not Recognized");
+}
 
         resultStart = millis();
         state = RESULT;
@@ -944,27 +947,31 @@ void setupFirebase() {
 // ==================================================================
 //  User lookups
 // ==================================================================
-String getUserNameByFingerprintID(int fingerID) {
+String getUserNameByFingerprintID(int fingerID, String &regNo) {
   for (int i = 0; i < userCacheCount; i++) {
     if (userCache[i].hasFingerprint && userCache[i].fingerprintID == fingerID) {
+      regNo = userCache[i].regNo;
       return userCache[i].name;
     }
   }
+  regNo = "N/A";
   return "Unknown (ID #" + String(fingerID) + ")";
 }
 
-String getUserNameByRFID(String uid, String &matchedKey) {
+String getUserNameByRFID(String uid, String &matchedKey, String &regNo) {
   for (int i = 0; i < userCacheCount; i++) {
     if (userCache[i].hasRFID && userCache[i].rfidUID == uid) {
       matchedKey = uid;
+      regNo = userCache[i].regNo;
       return userCache[i].name;
     }
   }
   matchedKey = "";
+  regNo = "N/A";
   return "Unknown (UID " + uid + ")";
 }
 
-void logAttendance(String name, String mode, String idField, String idValue) {
+void logAttendance(String name, String regNo, String mode, String idField, String idValue) {
   if (!firebaseReady || !Firebase.ready()) {
     Serial.println("Firebase not ready, skipping log.");
     return;
@@ -975,6 +982,7 @@ void logAttendance(String name, String mode, String idField, String idValue) {
   json.set("mode", mode);
   json.set(idField, idValue);
   json.set("Name", name);
+  json.set("RegNo", regNo);
   json.set("Status", "Present");
   json.set("Date", getDateString());
   json.set("Time", getTimeString());
@@ -1025,6 +1033,8 @@ void refreshUserCache() {
     rec.rfidUID = rec.hasRFID ? uidData.stringValue : "";
 
     rec.name = userObj.get(nameData, "name") ? nameData.stringValue : "Unknown";
+    FirebaseJsonData regData;                                    // NEW
+    rec.regNo = userObj.get(regData, "regNo") ? regData.stringValue : "N/A";
 
     userCache[idx++] = rec;
   }
